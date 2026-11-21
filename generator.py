@@ -143,3 +143,59 @@ def generate(n_planets, n_routes, n_missions, seed=1, horizon_days=30):
         s.caps = 1 | (2 if rng.random() < 0.3 else 0)
         s.alive = True
         ships.append(s)
+
+    
+    # ---- dataset missions
+    H = horizon_days * 24.0
+    missions = []
+    for i in range(n_missions):
+        o = rng.randrange(n)
+        d = o
+        for _ in range(3):
+            d = rng.choice(nb[d][: max(2, len(nb[d]))])
+        if d == o:
+            d = nb[o][0]
+        res = rng.choices(range(NR), [3, 3, 2, 2, 2, 1, 1])[0]
+        rel = rng.uniform(0, H * 0.6) if rng.random() < 0.5 else 0.0
+        missions.append(make_mission(i, o, d, res, rng.randint(50, 600), rel, rel + rng.uniform(48, 240),
+                                     rng.randint(1, 10), round(rng.uniform(0.5, 2.0), 2)))
+
+      # ---- infrastructure candidates (budget = 20% of total cost)
+    facs = []
+    for p in rng.sample(range(n), max(1, int(n * 0.3))):
+        for kind in rng.sample(list(KINDS), 2):
+            (c0, c1), (b0, b1), res, pop, (s0, s1), cat = KINDS[kind]
+            f = Facility()
+            f.pid, f.kind, f.cost, f.btime = p, kind, rng.uniform(c0, c1), rng.uniform(b0, b1)
+            f.res = {r: rng.uniform(*rg) for r, rg in res.items()}
+            f.pop, f.strat, f.cat = pop, rng.uniform(s0, s1), cat
+            f.value = 0.0
+            facs.append(f)
+    budget = 0.2 * sum(f.cost for f in facs)
+
+       # ---- dynamic events
+    n_ev = max(10, int(10 + (n ** 0.5) * 2.5))
+    kinds = ["wormhole_collapse", "route_blocked", "pirate_blockade", "ship_destroyed", "emergency_medical",
+             "production_drop", "new_colony", "population_surge", "resource_unavailable", "priority_mission",
+             "route_danger", "ship_failure"]
+    weights = [1, 3, 3, 2, 2, 3, 1, 2, 2, 2, 3, 2]
+    events = []
+    for _ in range(n_ev):
+        k = rng.choices(kinds, weights)[0]
+        t = rng.uniform(24, H - 24)
+        sev = round(rng.uniform(0.3, 1.0), 2)
+        if k == "wormhole_collapse":
+            if not worm_ids:
+                continue
+            tgt = rng.choice(worm_ids)
+        elif k in ("route_blocked", "pirate_blockade", "route_danger"):
+            tgt = rng.randrange(g.m)
+        elif k in ("ship_destroyed", "ship_failure"):
+            tgt = rng.randrange(len(ships))
+        elif k == "new_colony":
+            tgt = (rng.uniform(0, side), rng.uniform(0, side))
+        else:
+            tgt = rng.randrange(n)
+        events.append((t, k, tgt, sev, rng.randrange(NR)))
+    events.sort(key=lambda e: e[0])
+    return g, ships, missions, facs, budget, events, nb
