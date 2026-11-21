@@ -52,3 +52,31 @@ class Galaxy:
             self.stock[r].append(stock[r]); self.cap[r].append(cap[r])
         self.adj.append([])
         return len(self.x) - 1
+
+    def _ecost(self, e, pi):
+        w = PROFILES[PNAMES[pi]]
+        fail = 1.0 - (1.0 - self.risk[e]) * self.rel[e]
+        tt = self.time[e] + (self.tmax[e] - self.tmin[e]) * 0.25     # mean + ~1 std (uncertainty)
+        return w[0] * self.dist[e] + w[1] * self.fuel[e] + w[2] * tt + w[3] * fail
+
+    def add_edge(self, u, v, dist, time, tmin, tmax, fuel, risk, cap, rel, worm=False):
+        e = len(self.eu)
+        self.eu.append(u); self.ev.append(v); self.dist.append(dist); self.time.append(time)
+        self.tmin.append(tmin); self.tmax.append(tmax); self.fuel.append(fuel); self.risk.append(risk)
+        self.ecap.append(cap); self.rel.append(rel); self.avail.append(True); self.worm.append(worm)
+        self.adj[u].append(2 * e); self.arc_to.append(v)
+        self.adj[v].append(2 * e + 1); self.arc_to.append(u)
+        for pi in range(len(PNAMES)):
+            c = self._ecost(e, pi)
+            self.cost[pi].append(c); self.base[pi].append(c)
+        return e
+
+    def refresh_edge(self, e):
+        for pi in range(len(PNAMES)):
+            self.cost[pi][e] = self._ecost(e, pi)
+
+    def psucc(self, e):
+        return (1.0 - self.risk[e]) * self.rel[e]
+
+    def euclid(self, a, b):
+        return math.hypot(self.x[a] - self.x[b], self.y[a] - self.y[b])
