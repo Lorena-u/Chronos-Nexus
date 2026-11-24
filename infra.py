@@ -83,3 +83,116 @@ def _dp(vs, ws, B, st, cell_limit=40_000_000):
         if keep[i][c]:
             ch.append(i); c -= wi[i]
     return dp[cap], ch
+
+def _bnb(vs, ws, B, st, node_limit, lb0, ch0):
+    """Depth-first Branch & Bound on ratio-sorted items with fractional upper bound."""
+    n = len(vs)
+    order = sorted(range(n), key=lambda i: -vs[i] / ws[i])
+    V = [vs[i] for i in order]; W = [ws[i] for i in order]
+
+    def bound(i, cap, val):
+        while i < n:
+            if W[i] <= cap:
+                cap -= W[i]; val += V[i]
+            else:
+                return val + V[i] * cap / W[i]
+            i += 1
+        return val
+
+    best, bestset, nodes = lb0, list(ch0), 0
+    stack = [(0, B, 0.0, None)]
+    while stack and nodes < node_limit:
+        i, cap, val, link = stack.pop()
+        nodes += 1
+        if val > best:
+            best = val
+            bestset = []
+            l = link
+            while l is not None:
+                bestset.append(order[l[0]]); l = l[1]
+        if i >= n or bound(i, cap, val) <= best + 1e-12:
+            continue
+        stack.append((i + 1, cap, val, link))                      # exclude i
+        if W[i] <= cap:
+            stack.append((i + 1, cap - W[i], val + V[i], (i, link)))  # include i (explored first)
+    st.add("bnb_nodes", nodes)
+    return best, bestset, nodes >= node_limit
+
+def _core(vs, ws, B, st, mode):
+    n = len(vs)
+    order = sorted(range(n), key=lambda i: -vs[i] / ws[i])
+    V = [vs[i] for i in order]; W = [ws[i] for i in order]
+    PW, PV = [0], [0.0]
+    for i in range(n):
+        PW.append(PW[-1] + W[i]); PV.append(PV[-1] + V[i])
+
+    def lp(cap):
+        if cap <= 0:
+            return 0.0
+        k = bisect.bisect_right(PW, cap) - 1
+        if k >= n:
+            return PV[n]
+        return PV[k] + (cap - PW[k]) * V[k] / W[k]
+
+    lb, lbset = _greedy(vs, ws, B)
+    c = bisect.bisect_right(PW, B) - 1       # first item that does not fit fully
+    fixed_in, fixed_out, core = [], [], []
+    for pos in range(n):
+        i = order[pos]
+        if pos < c:
+            if lp(B + W[pos]) - V[pos] < lb - 1e-9:
+                fixed_in.append(i); continue
+        else:
+            ub = V[pos] + lp(B - W[pos]) if B - W[pos] >= 0 else -1.0
+            if ub < lb - 1e-9:
+                fixed_out.append(i); continue
+        core.append(i)
+    st.add("knap_fixed", len(fixed_in) + len(fixed_out))
+    B2 = B - sum(ws[i] for i in fixed_in)
+    cv = [vs[i] for i in core]; cw = [ws[i] for i in core]
+    base = sum(vs[i] for i in fixed_in)
+    if not core:
+        return base, fixed_in, "fixing-only"
+    cells = len(core) * max(1, B2 // max(1, B // 4000))
+    if mode in ("dp",) or (mode == "core" and cells <= 6_000_000):
+        v, ch = _dp(cv, cw, B2, st); how = "core+DP"
+    else:
+        g0 = _greedy(cv, cw, B2)
+        v, ch, trunc = _bnb(cv, cw, B2, st, 150_000, g0[0], g0[1]); how = "core+B&B" + ("(truncated)" if trunc else "")
+    return base + v, fixed_in + [core[j] for j in ch], how
+
+def solve(facs, budget, mode, st, scale=10):
+    """Return (chosen facility indices, total value, method)."""
+    items = [i for i, f in enumerate(facs) if f.value > 0 and f.cost <= budget]
+    vs = [facs[i].value for i in items]
+    ws = [max(1, -(-int(facs[i].cost * 100) // (scale * 100))) for i in items]   # ceil: never exceed budget
+    B = int(budget // scale)
+    n = len(items)
+    st.add("knap_items", n)
+    st.add("naive_knap_cells", n * B)           # the full DP table a naive exact solver would fill
+    if n == 0:
+        return [], 0.0, "empty"
+    if mode == "auto":
+        mode = "core"
+    if mode == "greedy":
+        v, ch = _greedy(vs, ws, B); how = "greedy"
+    elif mode == "dp":
+        v, ch = _dp(vs, ws, B, st); how = "dp"
+    elif mode == "bnb":
+        g0 = _greedy(vs, ws, B)
+        v, ch, tr = _bnb(vs, ws, B, st, 400_000, g0[0], g0[1]); how = "bnb" + ("(truncated)" if tr else "")
+    else:
+        v, ch, how = _core(vs, ws, B, st, "core")
+    chosen = [items[i] for i in ch]
+    return chosen, sum(facs[i].value for i in chosen), how
+
+def lp_upper_bound(facs, budget):
+    items = sorted((f for f in facs if f.value > 0), key=lambda f: -f.value / f.cost)
+    cap, val = budget, 0.0
+    for f in items:
+        if f.cost <= cap:
+            cap -= f.cost; val += f.value
+        else:
+            val += f.value * cap / f.cost
+            break
+    return val
