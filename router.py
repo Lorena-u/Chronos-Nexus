@@ -172,4 +172,158 @@ class Router:
             ps *= g.psucc(e)
         r.time, r.fuel, r.dist, r.tvar, r.psucc, r.cap = t, f, d, var, ps, cap
         return r
+
+    def _register(self, key, route):
+        if route is None:
+            return
+        for a in route.arcs:
+            self.edge_users.setdefault(a >> 1, set()).add(key)
+    
+    def search(self, src, dst, pi, force=None):
+        key = (src, dst, pi)
+        if key in self.cache:
+            self.st.add("route_cache_hits")
+            return self.cache[key]
+        use_h = self._use_alt() if force is None else force
+        if src == dst:
+            r = self._mk(src, dst, pi, [], 0.0)
+        else:
+            r, ex = self._astar(src, dst, pi, use_h)
+            self.st.add("nodes_explored", ex)
+            self.st.add("route_queries")
+        self.cache[key] = r
+        self._register(key, r)
+        return r
+
+    # ------------------------------------------------------------------ Pareto (multi-objective)
+    def pareto(self, src, dst, eps=0.04, cap=6, max_labels=20000):
+        """Label-setting search over (time, fuel, -log P(success)).
+
+        Search-space reduction: epsilon-dominance (labels at a node must differ by
+        >4% in some objective), at most `cap` labels per node, ellipse corridor
+        around src-dst, and pruning by labels already settled at the destination.
+        """
+        g = self.g
+        d0 = g.euclid(src, dst)
+        lim = 1.5 * d0 + 60.0
+        adj, arc_to, avail = g.adj, g.arc_to, g.avail
+        labels = {src: [(0.0, 0.0, 0.0)]}
+        heap = [(0.0, 0, (0.0, 0.0, 0.0), src, None, -1)]
+        nid = 1
+        goal = []
+        out = []
+        pops = 0
+        while heap and pops < max_labels:
+            s, _, (t, f, r), u, parent, arc = heappop(heap)
+            pops += 1
+            node = (t, f, r, u, parent, arc)
+            if u == dst:
+                if not any(o[0] <= t and o[1] <= f and o[2] <= r for o in goal):
+                    goal.append((t, f, r)); out.append(node)
+                continue
+            for a in adj[u]:
+                e = a >> 1
+                if not avail[e]:
+                    continue
+                v = arc_to[a]
+                if g.euclid(src, v) + g.euclid(v, dst) > lim:
+                    continue
+                nt = t + g.time[e] + (g.tmax[e] - g.tmin[e]) * 0.25
+                nf = f + g.fuel[e]
+                nr = r - math.log(max(g.psucc(e), 1e-9))
+                if any(o[0] <= nt and o[1] <= nf and o[2] <= nr for o in goal):
+                    continue
+                lv = labels.setdefault(v, [])
+                dom = False
+                for (lt, lf, lr) in lv:
+                    if lt <= nt * (1 + eps) and lf <= nf * (1 + eps) and lr <= nr * (1 + eps) + 1e-9:
+                        dom = True
+                        break
+                if dom or len(lv) >= cap:
+                    continue
+                lv.append((nt, nf, nr))
+                heappush(heap, (nt / 50.0 + nf / 100.0 + nr * 10.0, nid, (nt, nf, nr), v, node, a))
+                nid += 1
+        self.st.add("pareto_labels", pops)
+        # final filter: drop labels dominated by a later-settled one
+        out = [o for o in out if not any(q is not o and q[0] <= o[0] and q[1] <= o[1] and q[2] <= o[2] and
+                                          (q[0], q[1], q[2]) != (o[0], o[1], o[2]) for q in out)]        
+        routes = []
+        for (t, f, r, u, parent, arc) in out:
+            arcs = []
+            node = (t, f, r, u, parent, arc)
+            while node[4] is not None:
+                arcs.append(node[5]); node = node[4]
+            arcs.reverse()
+            routes.append(self._mk(src, dst, PID["emergency"], arcs, t))
+        return routes
+
+    def emergency_route(self, src, dst):
+        key = (src, dst, 3)           # 3 = "pareto" pseudo-profile
+        if key in self.cache:
+            return self.cache[key]
+        routes = self.pareto(src, dst)
+        if not routes:
+            r = self.search(src, dst, PID["emergency"])
+        else:
+            best_p = max(x.psucc for x in routes)
+            ok = [x for x in routes if x.psucc >= best_p * 0.95]
+            r = min(ok, key=lambda x: x.time + 2.0 * math.sqrt(x.tvar))
+        self.cache[key] = r
+        self._register(key, r)
+        return r
+
+    # ------------------------------------------------------------------ flow candidate search
+    def nearest_targets(self, src, pi, pred, k, maxcost):
+        """Dijkstra stopped after k target nodes (satisfying pred) are settled."""
+        g = self.g
+        adj, arc_to, avail, cost = g.adj, g.arc_to, g.avail, g.cost[pi]
+        dist = {src: 0.0}
+        done = set()
+        heap = [(0.0, src)]
+        res = []
+        ex = 0
+        while heap and len(res) < k:
+            d, u = heappop(heap)
+            if u in done:
+                continue
+            done.add(u); ex += 1
+            if d > maxcost:
+                break
+            if u != src and pred(u):
+                res.append((u, d))
+            for a in adj[u]:
+                e = a >> 1
+                if not avail[e]:
+                    continue
+                v = arc_to[a]
+                nd = d + cost[e]
+                if nd < dist.get(v, INF):
+                    dist[v] = nd
+                    heappush(heap, (nd, v))
+        self.st.add("nodes_explored", ex)
+        return res
+
+    # ------------------------------------------------------------------ dynamic updates
+    def invalidate_edges(self, edges):
+        """Drop every cached route that traverses one of `edges`; return their keys."""
+        keys = set()
+        for e in edges:
+            ks = self.edge_users.pop(e, None)
+            if ks:
+                keys |= ks
+        for k in keys:
+            r = self.cache.pop(k, None)
+            if r is not None:
+                for a in r.arcs:
+                    s = self.edge_users.get(a >> 1)
+                    if s:
+                        s.discard(k)
+        return keys
+
+    def clear(self):
+        self.cache.clear(); self.edge_users.clear()
+
+    def drop_failed(self):
+        self.cache = {k: v for k, v in self.cache.items() if v is not None}
     
